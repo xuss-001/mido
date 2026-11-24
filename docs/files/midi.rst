@@ -113,6 +113,34 @@ the context manager exits.
 Examples can be found in ``test_midifiles2.py``.
 
 
+Extracting a Segment
+--------------------
+
+Use ``extract()`` to create a new file containing a range of playback time in
+seconds::
+
+    from mido import MidiFile
+
+    mid = MidiFile('song.mid')
+    segment = mid.extract(start=12.5, end=30.0)
+    segment.save('practice.mid')
+
+The range is half-open: events at ``start`` are included and events at ``end``
+are excluded. The returned file starts at time zero, keeps the original track
+layout, and includes tempo changes inside the range. Tempo is read across all
+tracks, so type 1 files with a separate conductor track are supported.
+
+Channel state that was set before ``start`` (tempo, time signature, program,
+volume, pan and pitch bend, as well as other controller values) is restored at
+time zero. Notes held across ``start`` continue from zero, and notes still held
+at ``end`` are closed at the end of the segment. The source file is not
+modified.
+
+This operation supports type 0 and type 1 files with metrical timing. Type 2
+files and files containing sustain pedal messages (control change 64) are not
+supported and raise an error.
+
+
 File Types
 ----------
 

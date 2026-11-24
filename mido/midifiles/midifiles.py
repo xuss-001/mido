@@ -22,12 +22,13 @@ http://www.sonicspot.com/guide/midifiles.html
 import string
 import struct
 import time
-from numbers import Integral
+from math import isfinite
+from numbers import Integral, Real
 
 from ..messages import SPEC_BY_STATUS, Message
 from .meta import MetaMessage, build_meta_message, encode_variable_int, meta_charset
 from .tracks import MidiTrack, fix_end_of_track, merge_tracks
-from .units import tick2second
+from .units import second2tick, tick2second
 
 # The default tempo is 120 BPM.
 # (500000 microseconds per beat (quarter note).)
@@ -36,6 +37,10 @@ DEFAULT_TICKS_PER_BEAT = 480
 
 # Maximum message length to attempt to read.
 MAX_MESSAGE_LENGTH = 1000000
+
+
+class SustainPedalError(ValueError):
+    """Raised when extracting from a file that uses the sustain pedal."""
 
 
 def print_byte(byte, pos=0):
@@ -288,6 +293,315 @@ def get_seconds_per_tick(tempo, ticks_per_beat):
     return (tempo / 1000000.0) / ticks_per_beat
 
 
+def _absolute_events(tracks):
+    """Return all messages with their absolute tick and location."""
+    events = []
+    for track_index, track in enumerate(tracks):
+        tick = 0
+        for message_index, message in enumerate(track):
+            tick += message.time
+            events.append((tick, track_index, message_index, message))
+
+    events.sort(key=lambda event: event[:3])
+    return events
+
+
+def _tempo_changes(events):
+    """Return the effective tempo changes in playback order."""
+    changes = []
+    for tick, track_index, _, message in events:
+        if message.type == 'set_tempo':
+            if changes and changes[-1][0] == tick:
+                # Tempo changes at the same tick use the last message.
+                changes[-1] = (tick, message.tempo, track_index)
+            else:
+                changes.append((tick, message.tempo, track_index))
+
+    return changes
+
+
+def _second_to_tick(seconds, changes, ticks_per_beat):
+    previous_tick = 0
+    previous_seconds = 0.0
+    tempo = DEFAULT_TEMPO
+
+    for change_tick, new_tempo, _ in changes:
+        if change_tick == previous_tick:
+            tempo = new_tempo
+            continue
+
+        change_seconds = previous_seconds + tick2second(
+            change_tick - previous_tick, ticks_per_beat, tempo)
+        if seconds <= change_seconds:
+            elapsed_ticks = second2tick(
+                seconds - previous_seconds, ticks_per_beat, tempo)
+            return int(round(previous_tick + elapsed_ticks))
+
+        previous_tick = change_tick
+        previous_seconds = change_seconds
+        tempo = new_tempo
+
+    elapsed_ticks = second2tick(
+        seconds - previous_seconds, ticks_per_beat, tempo)
+    return int(round(previous_tick + elapsed_ticks))
+
+
+def _state_before_start(track, start_tick):
+    """Snapshot a track's name and held notes before the segment."""
+    notes = {}
+    track_name = None
+    tick = 0
+
+    for message in track:
+        tick += message.time
+        if tick >= start_tick:
+            break
+
+        if message.type == 'note_on' and message.velocity > 0:
+            notes[(message.channel, message.note)] = message.velocity
+        elif (message.type == 'note_off' or
+              (message.type == 'note_on' and message.velocity == 0)):
+            notes.pop((message.channel, message.note), None)
+        elif message.type == 'track_name' and track_name is None:
+            track_name = message
+
+    return {
+        'notes': notes,
+        'track_name': track_name,
+    }
+
+
+def _channel_state_before_start(events, start_tick):
+    """Snapshot channel-wide state before the segment."""
+    programs = {}
+    controls = {}
+    pitchwheels = {}
+
+    for tick, track_index, _, message in events:
+        if tick >= start_tick:
+            break
+
+        if message.type == 'program_change':
+            programs[message.channel] = (message.program, track_index)
+        elif message.type == 'control_change':
+            controls[(message.channel, message.control)] = (
+                message.value, track_index)
+        elif message.type == 'pitchwheel':
+            pitchwheels[message.channel] = (message.pitch, track_index)
+
+    return {
+        'programs': programs,
+        'controls': controls,
+        'pitchwheels': pitchwheels,
+    }
+
+
+def _global_state_before_start(events, start_tick):
+    """Snapshot playback-wide state before the segment."""
+    tempo = None
+    time_signature = None
+
+    for tick, track_index, _, message in events:
+        if tick >= start_tick:
+            break
+
+        if message.type == 'set_tempo':
+            tempo = (message, track_index)
+        elif message.type == 'time_signature':
+            time_signature = (message, track_index)
+
+    return tempo, time_signature
+
+
+def _empty_tracks(track_count):
+    return [
+        MidiTrack([MetaMessage('end_of_track', time=0)])
+        for _ in range(track_count)
+    ]
+
+
+def _extract_segment(midifile, start, end):
+    if midifile.type == 2:
+        raise ValueError(
+            "can't extract a segment from a type 2 (asynchronous) file")
+    if midifile.ticks_per_beat <= 0:
+        raise ValueError(
+            'extracting a segment requires metrical timing '
+            '(positive ticks_per_beat)')
+    if (not isinstance(start, Real) or not isinstance(end, Real) or
+            not isfinite(start) or not isfinite(end)):
+        raise TypeError('start and end must be finite numbers')
+    if start < 0:
+        raise ValueError('start must be non-negative')
+    if end < start:
+        raise ValueError('end must be greater than or equal to start')
+
+    events = _absolute_events(midifile.tracks)
+    for tick, track_index, _, message in events:
+        if message.type == 'control_change' and message.control == 64:
+            raise SustainPedalError(
+                'cannot extract a segment from a MIDI file that contains '
+                'sustain pedal (control change 64) messages '
+                f'(track {track_index}, tick {tick})')
+
+    changes = _tempo_changes(events)
+    start_tick = _second_to_tick(start, changes, midifile.ticks_per_beat)
+    end_tick = _second_to_tick(end, changes, midifile.ticks_per_beat)
+
+    if end_tick <= start_tick:
+        return MidiFile(
+            type=midifile.type,
+            ticks_per_beat=midifile.ticks_per_beat,
+            charset=midifile.charset,
+            tracks=_empty_tracks(len(midifile.tracks)))
+
+    duration_tick = end_tick - start_tick
+    tempo_state, time_signature_state = _global_state_before_start(
+        events, start_tick)
+    track_states = [
+        _state_before_start(track, start_tick)
+        for track in midifile.tracks
+    ]
+    channel_state = _channel_state_before_start(events, start_tick)
+    track_events = [[] for _ in midifile.tracks]
+
+    for tick, track_index, _, message in events:
+        if message.type == 'end_of_track':
+            continue
+        if start_tick <= tick < end_tick:
+            track_events[track_index].append(
+                (tick - start_tick, message))
+
+    has_playback = False
+    used_channels = set()
+    for messages in track_events:
+        for _, message in messages:
+            if not message.is_meta:
+                has_playback = True
+            if hasattr(message, 'channel'):
+                used_channels.add(message.channel)
+    for state in track_states:
+        if state['notes']:
+            has_playback = True
+            used_channels.update(
+                channel for channel, _ in state['notes'])
+
+    new_tracks = []
+    for track_index, _ in enumerate(midifile.tracks):
+        entries = []
+        state = track_states[track_index]
+        track_has_playback = (
+            any(not message.is_meta
+                for _, message in track_events[track_index]) or
+            bool(state['notes']))
+
+        if tempo_state is not None:
+            message, source_track = tempo_state
+            if source_track == track_index:
+                entries.append((0, message.copy(time=0)))
+        if time_signature_state is not None:
+            message, source_track = time_signature_state
+            if source_track == track_index:
+                entries.append((0, message.copy(time=0)))
+
+        if track_has_playback:
+            if state['track_name'] is not None:
+                entries.append((0, state['track_name'].copy(time=0)))
+
+        if has_playback:
+            for channel in sorted(used_channels):
+                if channel not in channel_state['programs']:
+                    continue
+                program, source_track = channel_state['programs'][channel]
+                if source_track != track_index:
+                    continue
+                entries.append((
+                    0,
+                    Message('program_change',
+                            channel=channel,
+                            program=program,
+                            time=0)))
+            for channel, control in sorted(channel_state['controls']):
+                if channel not in used_channels:
+                    continue
+                value, source_track = channel_state['controls'][
+                    (channel, control)]
+                if source_track != track_index:
+                    continue
+                entries.append((
+                    0,
+                    Message('control_change',
+                            channel=channel,
+                            control=control,
+                            value=value,
+                            time=0)))
+            for channel in sorted(used_channels):
+                if channel not in channel_state['pitchwheels']:
+                    continue
+                pitch, source_track = channel_state['pitchwheels'][channel]
+                if source_track != track_index:
+                    continue
+                entries.append((
+                    0,
+                    Message('pitchwheel',
+                            channel=channel,
+                            pitch=pitch,
+                            time=0)))
+
+        if track_has_playback:
+            for channel, note in sorted(state['notes']):
+                entries.append((
+                    0,
+                    Message('note_on',
+                            channel=channel,
+                            note=note,
+                            velocity=state['notes'][(channel, note)],
+                            time=0)))
+
+        for message_tick, message in track_events[track_index]:
+            entries.append((message_tick, message.copy(time=0)))
+
+        active_notes = dict(state['notes'])
+        for _, message in track_events[track_index]:
+            key = (message.channel, message.note) \
+                if message.type in ('note_on', 'note_off') else None
+            if key is None:
+                continue
+            if message.type == 'note_on' and message.velocity > 0:
+                active_notes[key] = message.velocity
+            else:
+                active_notes.pop(key, None)
+
+        for channel, note in sorted(active_notes):
+            entries.append((
+                duration_tick,
+                Message('note_off',
+                        channel=channel,
+                        note=note,
+                        velocity=64,
+                        time=0)))
+
+        entries.append((
+            duration_tick,
+            MetaMessage('end_of_track', time=0)))
+        entries.sort(key=lambda entry: entry[0])
+
+        output_track = MidiTrack()
+        previous_tick = 0
+        for message_tick, message in entries:
+            delta = message_tick - previous_tick
+            output_track.append(message.copy(time=delta))
+            previous_tick = message_tick
+
+        new_tracks.append(output_track)
+
+    return MidiFile(
+        type=midifile.type,
+        ticks_per_beat=midifile.ticks_per_beat,
+        charset=midifile.charset,
+        tracks=new_tracks)
+
+
 class MidiFile:
     def __init__(self, filename=None, file=None,
                  type=1, ticks_per_beat=DEFAULT_TICKS_PER_BEAT,
@@ -485,6 +799,36 @@ class MidiFile:
                 if isinstance(msg, MetaMessage) or not meta_only:
                     print(f'{msg!r}')  # noqa: T201
 
+    def extract(self, start, end):
+        """Return a new file containing the segment from start to end.
+
+        The start and end times are in seconds and the segment is
+        half-open: messages at ``start`` are included while messages at
+        ``end`` are excluded. The returned file starts at zero and can be
+        saved and loaded like any other ``MidiFile``.
+
+        Type 0 and type 1 files are supported. Tempo is global across all
+        tracks. Channel state and notes that are already active at
+        ``start`` are restored at time zero, and notes still active at
+        ``end`` are closed at the end of the segment.
+
+        Files that use the sustain pedal (control change 64) are not
+        supported and raise ``SustainPedalError``.
+        """
+        return _extract_segment(self, start, end)
+
+    def extract_segment(self, start, end):
+        """Alias for :meth:`extract`."""
+        return self.extract(start, end)
+
+    def slice(self, start, end):
+        """Alias for :meth:`extract`."""
+        return self.extract(start, end)
+
+    def cut(self, start, end):
+        """Alias for :meth:`extract`."""
+        return self.extract(start, end)
+
     def __repr__(self):
         if self.tracks:
             tracks_str = ',\n'.join(repr(track) for track in self.tracks)
@@ -507,3 +851,8 @@ class MidiFile:
 
     def __exit__(self, type, value, traceback):
         return False
+
+
+def extract_segment(midifile, start, end):
+    """Return a segment of ``midifile`` from ``start`` to ``end`` seconds."""
+    return midifile.extract(start, end)

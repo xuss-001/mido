@@ -179,6 +179,8 @@ Standard MIDI Files
    :inherited-members:
    :undoc-members:
 
+.. autoclass:: SustainPedalError
+
 .. autofunction:: tick2second
 
 .. autofunction:: second2tick
@@ -188,6 +190,8 @@ Standard MIDI Files
 .. autofunction:: tempo2bpm
 
 .. autofunction:: merge_tracks
+
+.. autofunction:: extract_segment
 
 .. module:: mido.midifiles
 
