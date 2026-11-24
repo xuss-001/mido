@@ -245,3 +245,60 @@ If you have a lot of rounding errors you should increase the time resolution
 with more ticks per quarter note, by setting MidiFile.ticks_per_beat to a
 large number. Typical values range from 96 to 480 but some use even more ticks
 per quarter note.
+
+
+SMPTE Frame Timing
+------------------
+
+Some MIDI files, especially those synchronized to video, do not use musical
+beats at all. In these files the ``MThd`` division field uses SMPTE time code:
+it stores a frame rate and a number of ticks per frame. Mido detects this
+automatically when reading the file.
+
+For a frame-timed file:
+
+* ``mid.is_smpte`` (also available as ``mid.is_frame_based``) is ``True``.
+* ``mid.frame_rate`` (also available as ``mid.smpte_fps``,
+  ``mid.frames_per_second``, and ``mid.fps``) is the frame rate in frames per
+  second. The four supported rates are 24, 25, 30, and 29.97. The MIDI header
+  marker ``29`` means 29.97 frames per second (30-drop-frame).
+* ``mid.ticks_per_frame`` is the number of ticks in one frame.
+* ``mid.ticks_per_beat`` is ``None``, since the file has no musical beat
+  resolution.
+
+The ``time`` attribute of messages inside a track is still a delta time in
+ticks, just as for beat-timed files. Iterating over the file converts those
+ticks to seconds using the frame rate and ticks per frame::
+
+    from mido import MidiFile
+
+    mid = MidiFile('video_score.mid')
+    if mid.is_smpte:
+        print(mid.frame_rate, mid.ticks_per_frame)
+
+    for msg in mid:
+        # time is in seconds and is independent of set_tempo messages
+        ...
+
+    print(mid.length)  # total playback time in seconds
+
+``set_tempo`` messages are preserved in the tracks, but they do not affect
+frame-based playback time. When the file is saved, the original SMPTE timing
+(frame rate and ticks per frame) is written back to the header.
+
+You can also create a frame-timed file directly::
+
+    mid = MidiFile(type=1, frame_rate=25, ticks_per_frame=40)
+    track = mid.add_track()
+    track.append(Message('note_on', note=60, time=0))
+    track.append(Message('note_off', note=60, time=1000))
+    mid.save('frame_timed.mid')
+
+For conversions outside a ``MidiFile``, use :py:func:`tick2second_smpte` and
+:py:func:`second2tick_smpte`. The general :py:func:`tick2second` and
+:py:func:`second2tick` functions accept ``frame_rate`` and
+``ticks_per_frame`` keyword arguments as well, but tempo-based and
+frame-based arguments cannot be mixed.
+
+An invalid frame rate, a ticks-per-frame value of zero, or mixing beat-based
+and frame-based conversion arguments raises ``ValueError``.

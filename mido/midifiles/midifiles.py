@@ -27,12 +27,23 @@ from numbers import Integral
 from ..messages import SPEC_BY_STATUS, Message
 from .meta import MetaMessage, build_meta_message, encode_variable_int, meta_charset
 from .tracks import MidiTrack, fix_end_of_track, merge_tracks
-from .units import tick2second
+from .units import (
+    normalize_frame_rate,
+    tick2second,
+    tick2second_smpte,
+)
 
 # The default tempo is 120 BPM.
 # (500000 microseconds per beat (quarter note).)
 DEFAULT_TEMPO = 500000
 DEFAULT_TICKS_PER_BEAT = 480
+
+
+class _DefaultTicksPerBeat(int):
+    """Marker type to distinguish the default from an explicit value."""
+
+
+_DEFAULT_TICKS_PER_BEAT = _DefaultTicksPerBeat(DEFAULT_TICKS_PER_BEAT)
 
 # Maximum message length to attempt to read.
 MAX_MESSAGE_LENGTH = 1000000
@@ -110,7 +121,33 @@ def read_file_header(infile):
         if len(data) < 6:
             raise EOFError
 
-        return struct.unpack('>hhh', data[:6])
+        return struct.unpack('>hhH', data[:6])
+
+
+def _parse_division(division):
+    """Parse the MThd division field.
+
+    Returns (ticks_per_beat, frame_rate, ticks_per_frame). For
+    beat-based files the last two values are None. For SMPTE files the
+    first value is None.
+    """
+    if division & 0x8000:
+        # Bits 14..8 contain the negative SMPTE frame rate in two's
+        # complement form and the low byte contains ticks per frame.
+        marker = 256 - ((division >> 8) & 0xff)
+        ticks_per_frame = division & 0xff
+
+        frame_rate = normalize_frame_rate(marker)
+        if ticks_per_frame == 0:
+            raise ValueError(
+                'invalid SMPTE timing: ticks per frame must be greater than 0')
+
+        return None, frame_rate, ticks_per_frame
+
+    if division == 0:
+        raise ValueError('invalid timing: ticks per beat must be greater than 0')
+
+    return division, None, None
 
 
 def read_message(infile, status_byte, peek_data, delta, clip=False):
@@ -285,24 +322,70 @@ def get_seconds_per_tick(tempo, ticks_per_beat):
     #
     #    (500000 / 1000000) / 480 == 0.5 / 480 == 0.0010417
     #
+    if ticks_per_beat is None:
+        raise ValueError(
+            'ticks_per_beat is not applicable to SMPTE frame timing')
+    if ticks_per_beat <= 0:
+        raise ValueError('ticks_per_beat must be greater than 0')
+
     return (tempo / 1000000.0) / ticks_per_beat
 
 
 class MidiFile:
     def __init__(self, filename=None, file=None,
-                 type=1, ticks_per_beat=DEFAULT_TICKS_PER_BEAT,
+                 type=1, ticks_per_beat=_DEFAULT_TICKS_PER_BEAT,
                  charset='latin1',
                  debug=False,
                  clip=False,
-                 tracks=None
+                 tracks=None,
+                 frame_rate=None,
+                 ticks_per_frame=None,
+                 smpte_fps=None,
+                 frames_per_second=None,
+                 fps=None,
                  ):
 
         self.filename = filename
         self.type = type
-        self.ticks_per_beat = ticks_per_beat
         self.charset = charset
         self.debug = debug
         self.clip = clip
+
+        ticks_per_beat_given = ticks_per_beat is not _DEFAULT_TICKS_PER_BEAT
+        if not ticks_per_beat_given:
+            ticks_per_beat = DEFAULT_TICKS_PER_BEAT
+
+        frame_rates = [rate for rate in (frame_rate, smpte_fps,
+                                         frames_per_second, fps)
+                       if rate is not None]
+        if frame_rates:
+            normalized_rates = {normalize_frame_rate(rate)
+                                for rate in frame_rates}
+            if len(normalized_rates) > 1:
+                raise ValueError('conflicting SMPTE frame rates')
+            frame_rate = normalized_rates.pop()
+
+        self._frame_rate = None
+        self.ticks_per_frame = None
+
+        if frame_rate is not None:
+            if ticks_per_frame is None:
+                raise ValueError(
+                    'ticks_per_frame is required when frame_rate is set')
+            if ticks_per_beat_given and ticks_per_beat is not None:
+                raise ValueError(
+                    'ticks_per_beat cannot be used with frame_rate')
+            self.ticks_per_beat = None
+            self._set_frame_rate(frame_rate)
+            self._set_ticks_per_frame(ticks_per_frame)
+        else:
+            if ticks_per_frame is not None:
+                raise ValueError(
+                    'ticks_per_frame requires a SMPTE frame_rate')
+            if ticks_per_beat is None:
+                raise ValueError(
+                    'ticks_per_beat is required for beat-based timing')
+            self.ticks_per_beat = ticks_per_beat
 
         self.tracks = []
         self._merged_track = None
@@ -318,6 +401,97 @@ class MidiFile:
         elif self.filename is not None:
             with open(filename, 'rb') as file:
                 self._load(file)
+
+    @property
+    def is_smpte(self):
+        """True if the file is timed by SMPTE frames instead of beats."""
+        return self._frame_rate is not None
+
+    @property
+    def is_frame_based(self):
+        """Alias for :attr:`is_smpte`."""
+        return self.is_smpte
+
+    @property
+    def frame_rate(self):
+        """SMPTE frame rate in frames per second, or None for beat timing."""
+        return self._frame_rate
+
+    @frame_rate.setter
+    def frame_rate(self, frame_rate):
+        self._frame_rate = normalize_frame_rate(frame_rate)
+        self.ticks_per_beat = None
+
+    @property
+    def smpte_fps(self):
+        """Alias for :attr:`frame_rate`."""
+        return self._frame_rate
+
+    @smpte_fps.setter
+    def smpte_fps(self, frame_rate):
+        self.frame_rate = frame_rate
+
+    @property
+    def frames_per_second(self):
+        """Alias for :attr:`frame_rate`."""
+        return self._frame_rate
+
+    @frames_per_second.setter
+    def frames_per_second(self, frame_rate):
+        self.frame_rate = frame_rate
+
+    @property
+    def fps(self):
+        """Alias for :attr:`frame_rate`."""
+        return self._frame_rate
+
+    @fps.setter
+    def fps(self, frame_rate):
+        self.frame_rate = frame_rate
+
+    def _set_frame_rate(self, frame_rate):
+        self._frame_rate = normalize_frame_rate(frame_rate)
+
+    def _set_ticks_per_frame(self, ticks_per_frame):
+        if (not isinstance(ticks_per_frame, Integral) or
+                isinstance(ticks_per_frame, bool)):
+            raise ValueError('ticks_per_frame must be an integer')
+        if not 1 <= ticks_per_frame <= 0xff:
+            raise ValueError(
+                'ticks_per_frame must be in range 1..255')
+        self.ticks_per_frame = ticks_per_frame
+
+    def _set_timing_from_division(self, division):
+        ticks_per_beat, frame_rate, ticks_per_frame = _parse_division(division)
+        self.ticks_per_beat = ticks_per_beat
+        self._frame_rate = frame_rate
+        self.ticks_per_frame = ticks_per_frame
+
+    @property
+    def division(self):
+        """The raw MThd time division field."""
+        if self.is_smpte:
+            if self.frame_rate == 29.97:
+                marker = 29
+            else:
+                marker = int(self.frame_rate)
+
+            if self.ticks_per_frame is None:
+                raise ValueError(
+                    'ticks_per_frame is required for SMPTE timing')
+            if not 1 <= self.ticks_per_frame <= 0xff:
+                raise ValueError(
+                    'ticks_per_frame must be in range 1..255')
+
+            return (((256 - marker) & 0xff) << 8) | self.ticks_per_frame
+
+        if (not isinstance(self.ticks_per_beat, Integral) or
+                isinstance(self.ticks_per_beat, bool)):
+            raise TypeError('ticks_per_beat must be an integer')
+        if not 1 <= self.ticks_per_beat <= 0x7fff:
+            raise ValueError(
+                'ticks_per_beat must be in range 1..32767')
+        return self.ticks_per_beat
 
     @property
     def merged_track(self):
@@ -357,11 +531,19 @@ class MidiFile:
 
             (self.type,
              num_tracks,
-             self.ticks_per_beat) = read_file_header(infile)
+             division) = read_file_header(infile)
+
+            self._set_timing_from_division(division)
 
             if self.debug:
-                _dbg('-> type={}, tracks={}, ticks_per_beat={}'.format(
-                    self.type, num_tracks, self.ticks_per_beat))
+                if self.is_smpte:
+                    _dbg('-> type={}, tracks={}, frame_rate={}, '
+                         'ticks_per_frame={}'.format(
+                             self.type, num_tracks,
+                             self.frame_rate, self.ticks_per_frame))
+                else:
+                    _dbg('-> type={}, tracks={}, ticks_per_beat={}'.format(
+                        self.type, num_tracks, self.ticks_per_beat))
                 _dbg()
 
             for i in range(num_tracks):
@@ -387,19 +569,30 @@ class MidiFile:
         return sum(msg.time for msg in self)
 
     def __iter__(self):
-        tempo = DEFAULT_TEMPO
-        for msg in self.merged_track:
-            # Convert message time from absolute time
-            # in ticks to relative time in seconds.
-            if msg.time > 0:
-                delta = tick2second(msg.time, self.ticks_per_beat, tempo)
-            else:
-                delta = 0
+        if self.is_smpte:
+            for msg in self.merged_track:
+                # SMPTE delta times are independent of tempo messages.
+                if msg.time > 0:
+                    delta = tick2second_smpte(
+                        msg.time, self.frame_rate, self.ticks_per_frame)
+                else:
+                    delta = 0
 
-            yield msg.copy(skip_checks=True, time=delta)
+                yield msg.copy(skip_checks=True, time=delta)
+        else:
+            tempo = DEFAULT_TEMPO
+            for msg in self.merged_track:
+                # Convert message time from absolute time
+                # in ticks to relative time in seconds.
+                if msg.time > 0:
+                    delta = tick2second(msg.time, self.ticks_per_beat, tempo)
+                else:
+                    delta = 0
 
-            if msg.type == 'set_tempo':
-                tempo = msg.tempo
+                yield msg.copy(skip_checks=True, time=delta)
+
+                if msg.type == 'set_tempo':
+                    tempo = msg.tempo
 
     def play(self, meta_messages=False, now=time.time):
         """Play back all tracks.
@@ -461,9 +654,9 @@ class MidiFile:
 
     def _save(self, outfile):
         with meta_charset(self.charset):
-            header = struct.pack('>hhh', self.type,
+            header = struct.pack('>hhH', self.type,
                                  len(self.tracks),
-                                 self.ticks_per_beat)
+                                 self.division)
 
             write_chunk(outfile, b'MThd', header)
 
@@ -493,12 +686,22 @@ class MidiFile:
         else:
             tracks_str = ''
 
-        return '{}(type={}, ticks_per_beat={}{})'.format(
-            self.__class__.__name__,
-            self.type,
-            self.ticks_per_beat,
-            tracks_str,
-        )
+        if self.is_smpte:
+            return ('{}(type={}, ticks_per_beat=None, frame_rate={!r}, '
+                    'ticks_per_frame={!r}{})').format(
+                self.__class__.__name__,
+                self.type,
+                self.frame_rate,
+                self.ticks_per_frame,
+                tracks_str,
+            )
+        else:
+            return '{}(type={}, ticks_per_beat={}{})'.format(
+                self.__class__.__name__,
+                self.type,
+                self.ticks_per_beat,
+                tracks_str,
+            )
 
     # The context manager has no purpose but is kept around since it was
     # used in examples in the past.

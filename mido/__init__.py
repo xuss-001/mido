@@ -115,9 +115,14 @@ from .midifiles import (
     UnknownMetaMessage,
     bpm2tempo,
     merge_tracks,
+    normalize_frame_rate,
     second2tick,
+    second2tick_smpte,
+    smpte_second2tick,
+    smpte_tick2second,
     tempo2bpm,
     tick2second,
+    tick2second_smpte,
 )
 from .parser import Parser, parse, parse_all
 from .syx import read_syx_file, write_syx_file
@@ -141,6 +146,7 @@ __all__ = [
     "bpm2tempo",
     "format_as_string",
     "merge_tracks",
+    "normalize_frame_rate",
     "parse",
     "parse_all",
     "parse_string",
@@ -148,9 +154,13 @@ __all__ = [
     "ports",
     "read_syx_file",
     "second2tick",
+    "second2tick_smpte",
+    "smpte_second2tick",
+    "smpte_tick2second",
     "sockets",
     "tempo2bpm",
     "tick2second",
+    "tick2second_smpte",
     "version_info",
     "write_syx_file",
 ]
