@@ -189,6 +189,10 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+.. autofunction:: combine_midifiles
+
+.. autoexception:: ChannelAllocationError
+
 .. module:: mido.midifiles
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)

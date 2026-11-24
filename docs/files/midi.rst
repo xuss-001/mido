@@ -245,3 +245,37 @@ If you have a lot of rounding errors you should increase the time resolution
 with more ticks per quarter note, by setting MidiFile.ticks_per_beat to a
 large number. Typical values range from 96 to 480 but some use even more ticks
 per quarter note.
+
+
+Combining Multiple MIDI Files
+-----------------------------
+
+Several MIDI files can be layered into one type 1 file with
+:py:func:`combine_midifiles`. Each input is given as a
+``(MidiFile, offset)`` tuple where ``offset`` is a non-negative number
+of seconds by which the file is delayed::
+
+    from mido import MidiFile, combine_midifiles
+
+    first = MidiFile('first.mid')
+    second = MidiFile('second.mid')
+
+    combined = combine_midifiles(
+        [(first, 0.0), (second, 1.5)], ticks_per_beat=480)
+    combined.save('combined.mid')
+
+Both type 0 and type 1 files are accepted, and they may use different
+``ticks_per_beat`` values and tempo changes. Every event is converted
+through its playback time in seconds, so the actual timing is kept
+within one tick of the output resolution, and messages that happen at
+the same time in one input keep their original order. The output uses
+a constant 120 BPM tempo; tempo messages found in the inputs are
+replaced by this single tempo map.
+
+Each input file is rendered into its own track and receives its own
+melodic channels, so program changes, control changes and pitch bend
+messages never leak between files. The General MIDI drum channel
+(channel 10) stays exclusive: :class:`ChannelAllocationError` is raised
+if more than one input uses it, or if there are not enough melodic
+channels (the fifteen channels other than the drum channel) left for
+an input. The input files themselves are never modified.
