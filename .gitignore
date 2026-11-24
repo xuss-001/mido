@@ -23,3 +23,11 @@ docs/_build
 # Coverage output
 coverage.xml
 htmlcov/
+
+# Local credentials are never submission artifacts
+/.env
+/.env.local
+/private.key
+/auth.json
+/credentials-local.json
+/access-token.json
