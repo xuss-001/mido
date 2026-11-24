@@ -189,6 +189,16 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+.. autoclass:: NoteInterval
+   :members:
+
+.. autoclass:: NoteIntervalList
+   :members:
+
+.. autofunction:: note_intervals
+
+.. autofunction:: find_note_intervals
+
 .. module:: mido.midifiles
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)

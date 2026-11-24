@@ -146,6 +146,51 @@ a type 2 file will raise ``ValueError``, since it is impossible to
 compute the playback time of an asynchronous file.
 
 
+Note Intervals
+--------------
+
+For piano-roll display or practice playback, ``note_intervals()`` returns a
+list of note intervals instead of individual MIDI messages::
+
+    for interval in mid.note_intervals():
+        print(interval.note, interval.start_tick, interval.end_tick)
+        print(interval.start_seconds, interval.end_seconds)
+
+Each interval contains ``channel``, ``note``, ``velocity``, and ``track``
+(the index of the track that contained the note-on message), together with
+absolute tick and second values in ``start_tick``, ``end_tick``,
+``start_seconds``, and ``end_seconds``.
+
+The key release is available separately as ``release_tick`` and
+``release_seconds``.  When the sustain pedal (controller 64) is down, a
+note-off does not end the sound: the interval continues until the pedal is
+released.  All-sound-off (controller 120) ends the channel's notes
+immediately, while all-notes-off (controller 123) behaves like individual
+note-offs and is therefore also affected by the pedal.
+
+Note and pedal messages are matched by channel even when they occur in
+different tracks.  Repeated notes on the same channel and pitch are paired
+in note-on order.  A note-on with velocity 0 counts as a note-off.
+
+The query does not simulate a synthesizer envelope and never modifies the
+file.  It supports type 0 and type 1 files with a positive ticks-per-beat
+resolution.
+
+Problem cases are flagged explicitly:
+
+* ``orphan`` is true for a note-off without a matching note-on.  Its
+  ``start_tick`` and ``start_seconds`` are ``None``.
+* ``incomplete`` is true for a note that is still sounding at the end of the
+  file.  Its end is the end of the file and ``release_tick`` is ``None``.
+* ``end_reason`` and ``release_reason`` describe why the sound and the key
+  ended (for example ``sustain_pedal``, ``all_sound_off``, or
+  ``end_of_file``).
+
+The result objects are dictionary-compatible and also expose the same fields
+as attributes.  ``mid.note_intervals()`` is also available as
+``mido.note_intervals(mid)``.
+
+
 Meta Messages
 -------------
 

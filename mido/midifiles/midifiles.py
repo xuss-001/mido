@@ -288,6 +288,20 @@ def get_seconds_per_tick(tempo, ticks_per_beat):
     return (tempo / 1000000.0) / ticks_per_beat
 
 
+class _NoteIntervalsDescriptor:
+    """Expose note intervals as both a property and a method."""
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        from .notes import find_note_intervals
+        return find_note_intervals(instance)
+
+    def __call__(self, midifile):
+        from .notes import find_note_intervals
+        return find_note_intervals(midifile)
+
+
 class MidiFile:
     def __init__(self, filename=None, file=None,
                  type=1, ticks_per_beat=DEFAULT_TICKS_PER_BEAT,
@@ -436,6 +450,39 @@ class MidiFile:
                 continue
             else:
                 yield msg
+
+    note_intervals = _NoteIntervalsDescriptor()
+    note_intervals.__doc__ = """Return all note intervals in the file.
+
+    Each interval contains the channel, note number, note-on velocity,
+    source track index, start and end ticks, and start and end times in
+    seconds.  Key-release times are also available separately.  The
+    sustain pedal (controller 64), all-sound-off (120), and all-notes-off
+    (123) messages are applied across all tracks on the same channel.
+
+    Notes without a matching note-on and notes that are still active at
+    the end of the file are returned with an explicit marker.  The file
+    tracks are not modified.
+
+    This is supported for type 0 and type 1 files with a positive
+    ticks-per-beat resolution.
+    """
+
+    def find_note_intervals(self):
+        """Alias for :meth:`note_intervals`."""
+        return self.note_intervals()
+
+    def get_note_intervals(self):
+        """Alias for :meth:`note_intervals`."""
+        return self.note_intervals()
+
+    def notes(self):
+        """Alias for :meth:`note_intervals`."""
+        return self.note_intervals()
+
+    def note_spans(self):
+        """Alias for :meth:`note_intervals`."""
+        return self.note_intervals()
 
     def save(self, filename=None, file=None):
         """Save to a file.
