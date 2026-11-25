@@ -7,14 +7,31 @@ import io
 from pytest import raises
 
 from mido.messages import Message
-from mido.midifiles.meta import KeySignatureError, MetaMessage
-from mido.midifiles.midifiles import MidiFile, MidiTrack
+from mido.midifiles.meta import (
+    KeySignatureError,
+    MetaMessage,
+    UnknownMetaMessage,
+)
+from mido.midifiles.midifiles import (
+    MidiFile,
+    MidiFileError,
+    MidiFileTruncatedError,
+    MidiTrack,
+)
 
 HEADER_ONE_TRACK = """
 4d 54 68 64  # MThd
 00 00 00 06  # Chunk size
       00 01  # Type 1
       00 01  # 1 track
+      00 78  # 120 ticks per beat
+"""
+
+HEADER_TWO_TRACKS = """
+4d 54 68 64  # MThd
+00 00 00 06  # Chunk size
+      00 01  # Type 1
+      00 02  # 2 tracks
       00 78  # 120 ticks per beat
 """
 
@@ -194,3 +211,122 @@ def test_midifile_repr():
     for track, track_eval in zip(midifile.tracks, midifile_eval.tracks):
         for m1, m2 in zip(track, track_eval):
             assert m1 == m2
+
+
+def test_meta_message_length_does_not_read_next_track():
+    with raises(MidiFileError) as exc:
+        read_file(HEADER_TWO_TRACKS + """
+        4d 54 72 6b  # MTrk
+        00 00 00 04  # length ends right before the next track
+        00 ff 01 0a  # text message declares 10 data bytes
+
+        4d 54 72 6b  # MTrk
+        00 00 00 04
+        00 90 40 40
+        """)
+
+    message = str(exc.value)
+    assert 'track 0' in message
+    assert 'meta message data' in message
+    assert 'position 4' in message
+
+
+def test_sysex_length_does_not_read_next_track():
+    with raises(MidiFileError) as exc:
+        read_file(HEADER_TWO_TRACKS + """
+        4d 54 72 6b  # MTrk
+        00 00 00 03
+        00 f0 01  # sysex length consumes a byte from the next track
+
+        4d 54 72 6b  # MTrk
+        00 00 00 04
+        00 90 40 40
+        """)
+
+    message = str(exc.value)
+    assert 'track 0' in message
+    assert 'sysex message data' in message
+    assert 'position 3' in message
+
+
+def test_event_truncated_at_track_end():
+    with raises(MidiFileError) as exc:
+        read_file(HEADER_ONE_TRACK + """
+        4d 54 72 6b  # MTrk
+        00 00 00 02  # only delta time and status byte
+        00 90
+        """)
+
+    message = str(exc.value)
+    assert 'track 0' in message
+    assert 'MIDI message data' in message
+    assert 'position 2' in message
+
+
+def test_variable_int_too_long():
+    with raises(MidiFileError) as exc:
+        read_file(HEADER_ONE_TRACK + """
+        4d 54 72 6b  # MTrk
+        00 00 00 07
+        81 80 80 80 00  # five-byte delta time
+        90 40
+        """)
+
+    message = str(exc.value)
+    assert 'track 0' in message
+    assert 'variable-length integer' in message
+    assert 'maximum length of 4 bytes' in message
+    assert 'position 0' in message
+
+
+def test_truncated_track_reports_position():
+    with raises(MidiFileTruncatedError) as exc:
+        read_file(HEADER_ONE_TRACK + """
+        4d 54 72 6b  # MTrk
+        00 00 00 08  # declares eight bytes
+        00 90 40      # but the file ends here
+        """)
+
+    assert isinstance(exc.value, EOFError)
+    assert isinstance(exc.value, OSError)
+    message = str(exc.value)
+    assert 'track 0' in message
+    assert 'position 3' in message
+    assert 'unexpected end of file' in message
+
+
+def test_partial_reads_with_running_status_and_unknown_meta():
+    midi_file = MidiFile(type=1, ticks_per_beat=96)
+    midi_file.tracks.append(MidiTrack([
+        Message('note_on', note=60, velocity=64, time=0),
+        Message('note_on', note=62, velocity=65, time=32),
+        UnknownMetaMessage(0x60, data=(1, 2, 3), time=0),
+        MetaMessage('end_of_track'),
+    ]))
+    midi_file.tracks.append(MidiTrack([
+        Message('note_off', note=60, velocity=0, time=64),
+    ]))
+
+    buffer = io.BytesIO()
+    midi_file.save(file=buffer)
+
+    class PartialReadFile(io.BytesIO):
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = 1
+            return super().read(min(size, 1))
+
+    parsed = MidiFile(file=PartialReadFile(buffer.getvalue()))
+
+    assert parsed.type == 1
+    assert parsed.ticks_per_beat == 96
+    assert len(parsed.tracks) == 2
+    assert parsed.tracks[0][0] == Message(
+        'note_on', note=60, velocity=64, time=0)
+    assert parsed.tracks[0][1] == Message(
+        'note_on', note=62, velocity=65, time=32)
+    assert isinstance(parsed.tracks[0][2], UnknownMetaMessage)
+    assert parsed.tracks[0][2].type_byte == 0x60
+    assert parsed.tracks[0][2].data == (1, 2, 3)
+    assert parsed.tracks[1][0] == Message(
+        'note_off', note=60, velocity=0, time=64)

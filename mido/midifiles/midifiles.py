@@ -37,6 +37,28 @@ DEFAULT_TICKS_PER_BEAT = 480
 # Maximum message length to attempt to read.
 MAX_MESSAGE_LENGTH = 1000000
 
+# MIDI variable-length integers are limited to four bytes (28 bits).
+MAX_VARIABLE_INT_LENGTH = 4
+
+
+class MidiFileError(OSError):
+    """Raised when the contents of a MIDI file are malformed."""
+
+    def __init__(self, message, track=None, position=None,
+                 absolute_position=None):
+        super().__init__(message)
+        self.track = track
+        self.position = position
+        self.absolute_position = absolute_position
+
+
+class MidiFileTrackBoundaryError(MidiFileError, EOFError):
+    """Raised when an event runs past the end of its track chunk."""
+
+
+class MidiFileTruncatedError(MidiFileError, EOFError):
+    """Raised when a MIDI file ends before its declared data is complete."""
+
 
 def print_byte(byte, pos=0):
     char = chr(byte)
@@ -62,19 +84,68 @@ class DebugFileWrapper:
         return self.file.tell()
 
 
-def read_byte(self):
-    byte = self.read(1)
-    if byte == b'':
-        raise EOFError
+def _tell(infile):
+    try:
+        return infile.tell()
+    except (AttributeError, OSError):
+        return None
+
+
+def _format_position(track, position, absolute_position):
+    if track is None:
+        if absolute_position is None:
+            absolute_position = position
+        if absolute_position is None:
+            return 'unknown position'
+        return (f'absolute offset {absolute_position} '
+                f'(0x{absolute_position:x})')
+
+    text = (f'track {track}, position {position}, offset {position} '
+            f'(0x{position:x})')
+    if absolute_position is not None:
+        text += (f', absolute offset {absolute_position} '
+                 f'(0x{absolute_position:x})')
+    return text
+
+
+def _read_exact(infile, size, description='data'):
+    """Read exactly size bytes, retrying short reads."""
+    chunks = []
+    remaining = size
+
+    while remaining > 0:
+        chunk = infile.read(remaining)
+        if chunk is None:
+            chunk = b''
+        if not chunk:
+            raise EOFError(
+                f'unexpected end of file while reading {description}')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+
+    return b''.join(chunks)
+
+
+def read_byte(infile, description='byte'):
+    if isinstance(infile, _TrackReader):
+        byte = infile.read_exact(1, description)
     else:
-        return ord(byte)
+        byte = _read_exact(infile, 1, description)
+    return byte[0]
 
 
-def read_bytes(infile, size):
+def read_bytes(infile, size, description='message data'):
     if size > MAX_MESSAGE_LENGTH:
-        raise OSError('Message length {} exceeds maximum length {}'.format(
-            size, MAX_MESSAGE_LENGTH))
-    return [read_byte(infile) for _ in range(size)]
+        message = '{} length {} exceeds maximum length {}'.format(
+            description, size, MAX_MESSAGE_LENGTH)
+        if isinstance(infile, _TrackReader):
+            raise infile.error(message)
+        raise MidiFileError(message, position=_tell(infile))
+
+    if isinstance(infile, _TrackReader):
+        return list(infile.read_exact(size, description))
+    else:
+        return list(_read_exact(infile, size, description))
 
 
 def _dbg(text=''):
@@ -89,10 +160,8 @@ def _dbg(text=''):
 # 2. the chunk module assumes that chunks are padded to the nearest
 # multiple of 2. This is not true of MIDI files.
 
-def read_chunk_header(infile):
-    header = infile.read(8)
-    if len(header) < 8:
-        raise EOFError
+def read_chunk_header(infile, description='chunk header'):
+    header = _read_exact(infile, 8, description)
 
     # TODO: check for b'RIFF' and switch endian?
 
@@ -105,7 +174,7 @@ def read_file_header(infile):
     if name != b'MThd':
         raise OSError('MThd not found. Probably not a MIDI file')
     else:
-        data = infile.read(size)
+        data = _read_exact(infile, size, 'file header')
 
         if len(data) < 6:
             raise EOFError
@@ -121,7 +190,7 @@ def read_message(infile, status_byte, peek_data, delta, clip=False):
 
     # Subtract 1 for status byte.
     size = spec.length - 1 - len(peek_data)
-    data_bytes = peek_data + read_bytes(infile, size)
+    data_bytes = peek_data + read_bytes(infile, size, 'MIDI message data')
 
     if clip:
         data_bytes = [byte if byte < 127 else 127 for byte in data_bytes]
@@ -134,8 +203,8 @@ def read_message(infile, status_byte, peek_data, delta, clip=False):
 
 
 def read_sysex(infile, delta, clip=False):
-    length = read_variable_int(infile)
-    data = read_bytes(infile, length)
+    length = read_variable_int(infile, 'sysex message length')
+    data = read_bytes(infile, length, 'sysex message data')
 
     # Strip start and end bytes.
     # TODO: is this necessary?
@@ -150,56 +219,175 @@ def read_sysex(infile, delta, clip=False):
     return Message('sysex', data=data, time=delta)
 
 
-def read_variable_int(infile):
+def read_variable_int(infile, description='variable-length integer'):
     delta = 0
+    if isinstance(infile, _TrackReader):
+        start = infile.position
+    else:
+        start = _tell(infile)
 
-    while True:
-        byte = read_byte(infile)
+    for _ in range(MAX_VARIABLE_INT_LENGTH):
+        byte = read_byte(infile, f'{description} byte')
         delta = (delta << 7) | (byte & 0x7f)
         if byte < 0x80:
             return delta
 
+    message = ('{}: variable-length integer exceeds the maximum length '
+               'of {} bytes'.format(description, MAX_VARIABLE_INT_LENGTH))
+    if isinstance(infile, _TrackReader):
+        raise infile.error(message, position=start)
+    raise MidiFileError(message, position=start)
+
 
 def read_meta_message(infile, delta):
-    meta_type = read_byte(infile)
-    length = read_variable_int(infile)
-    data = read_bytes(infile, length)
+    meta_type = read_byte(infile, 'meta message type')
+    length = read_variable_int(infile, 'meta message length')
+    data = read_bytes(infile, length, 'meta message data')
     return build_meta_message(meta_type, data, delta)
 
 
-def read_track(infile, debug=False, clip=False):
+class _TrackReader:
+    """Read from a file without crossing the end of a track chunk."""
+
+    def __init__(self, infile, size, track_index, start):
+        self.infile = infile
+        self.size = size
+        self.track_index = track_index
+        self.start = start
+        self.position = 0
+        self.event_position = None
+
+    @property
+    def remaining(self):
+        return self.size - self.position
+
+    def tell(self):
+        return self.start + self.position
+
+    def location(self, position=None):
+        if position is None:
+            position = self.position
+        absolute = self.start + position
+        return _format_position(
+            self.track_index, position, absolute)
+
+    def error(self, message, position=None, exception_class=MidiFileError):
+        if position is None:
+            position = self.position
+        absolute = self.start + position
+
+        text = f'{_format_position(self.track_index, position, absolute)}: '
+        text += message
+        if self.event_position is not None:
+            text += (f'; event started at position {self.event_position} '
+                     f'(0x{self.event_position:x})')
+
+        return exception_class(
+            text,
+            track=self.track_index,
+            position=position,
+            absolute_position=absolute)
+
+    def truncated_error(self, description, read_position=None):
+        absolute = self.start + self.position
+        text = (f'{self.location()}: unexpected end of file while reading '
+                f'{description}')
+        if read_position is not None and read_position != self.position:
+            text += (f' starting at position {read_position} '
+                     f'(0x{read_position:x})')
+        if self.event_position is not None:
+            text += (f'; event started at position {self.event_position} '
+                     f'(0x{self.event_position:x})')
+
+        return MidiFileTruncatedError(
+            text,
+            track=self.track_index,
+            position=self.position,
+            absolute_position=absolute)
+
+    def read_exact(self, size, description='data'):
+        if size > self.remaining:
+            raise self.error(
+                '{} requests {} byte(s) but only {} byte(s) remain in '
+                'the track'.format(description, size, self.remaining),
+                exception_class=MidiFileTrackBoundaryError)
+
+        chunks = []
+        remaining = size
+        read_position = self.position
+        while remaining > 0:
+            chunk = self.infile.read(remaining)
+            if chunk is None:
+                chunk = b''
+            if not chunk:
+                raise self.truncated_error(description, read_position)
+
+            chunks.append(chunk)
+            self.position += len(chunk)
+            remaining -= len(chunk)
+
+        return b''.join(chunks)
+
+    def read(self, size):
+        return self.read_exact(size)
+
+
+def read_track(infile, debug=False, clip=False, track_index=None):
     track = MidiTrack()
 
-    name, size = read_chunk_header(infile)
+    header_position = _tell(infile)
+    try:
+        name, size = read_chunk_header(infile, 'track chunk header')
+    except EOFError as exc:
+        if track_index is None:
+            raise
+        text = (f'{_format_position(track_index, 0, header_position)}: '
+                f'{exc}')
+        raise MidiFileTruncatedError(
+            text,
+            track=track_index,
+            position=0,
+            absolute_position=header_position) from exc
 
     if name != b'MTrk':
-        raise OSError('no MTrk header at start of track')
+        text = 'no MTrk header at start of track'
+        if track_index is not None:
+            text = f'track {track_index}: {text}'
+        if header_position is not None:
+            text += (f' (absolute offset {header_position} '
+                     f'(0x{header_position:x}))')
+        raise MidiFileError(
+            text,
+            track=track_index,
+            absolute_position=header_position)
 
     if debug:
         _dbg(f'-> size={size}')
         _dbg()
 
     start = infile.tell()
+    reader = _TrackReader(infile, size, track_index, start)
     last_status = None
 
     while True:
         # End of track reached.
-        if infile.tell() - start == size:
+        if reader.remaining == 0:
             break
 
         if debug:
             _dbg('Message:')
 
-        delta = read_variable_int(infile)
+        reader.event_position = reader.position
+        delta = read_variable_int(reader, 'delta time')
 
         if debug:
             _dbg(f'-> delta={delta}')
 
-        status_byte = read_byte(infile)
+        status_byte = read_byte(reader, 'event status byte')
 
         if status_byte < 0x80:
             if last_status is None:
-                raise OSError('running status without last_status')
+                raise reader.error('running status without last_status')
             peek_data = [status_byte]
             status_byte = last_status
         else:
@@ -209,13 +397,13 @@ def read_track(infile, debug=False, clip=False):
             peek_data = []
 
         if status_byte == 0xff:
-            msg = read_meta_message(infile, delta)
+            msg = read_meta_message(reader, delta)
         elif status_byte in [0xf0, 0xf7]:
             # TODO: I'm not quite clear on the difference between
             # f0 and f7 events.
-            msg = read_sysex(infile, delta, clip)
+            msg = read_sysex(reader, delta, clip)
         else:
-            msg = read_message(infile, status_byte, peek_data, delta, clip)
+            msg = read_message(reader, status_byte, peek_data, delta, clip)
 
         track.append(msg)
 
@@ -370,8 +558,8 @@ class MidiFile:
 
                 self.tracks.append(read_track(infile,
                                               debug=self.debug,
-                                              clip=self.clip))
-                # TODO: used to ignore EOFError. I hope things still work.
+                                              clip=self.clip,
+                                              track_index=i))
 
     @property
     def length(self):
