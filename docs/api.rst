@@ -169,6 +169,13 @@ Standard MIDI Files
    :inherited-members:
    :undoc-members:
 
+.. autoclass:: MidiFileStream
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autofunction:: open_midifile
+
 .. autoclass:: MidiTrack
    :members:
    :inherited-members:

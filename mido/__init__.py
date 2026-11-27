@@ -29,6 +29,7 @@ Ports:
 MIDI files:
 
     MidiFile(filename, **kwargs) -- open a MIDI file
+    open_midifile(source, **kwargs) -- open a large MIDI file lazily
     MidiTrack()  -- a MIDI track
     bpm2tempo()  -- convert beats per minute to MIDI file tempo
     tempo2bpm()  -- convert MIDI file tempo to beats per minute
@@ -109,13 +110,29 @@ from .messages import (
 )
 from .midifiles import (
     KeySignatureError,
+    LazyMidiFile,
+    LazyMidiFileReader,
+    LazyMidiFileStream,
     MetaMessage,
     MidiFile,
+    MidiFileReader,
+    MidiFileStream,
+    MidiFileStreamReader,
+    MidiStream,
     MidiTrack,
+    MidiTrackStream,
+    StreamingMidiFile,
+    StreamingMidiFileReader,
     UnknownMetaMessage,
     bpm2tempo,
     merge_tracks,
+    open_midi_file,
+    open_midifile,
+    open_stream,
+    read_midi,
     second2tick,
+    stream_midi_file,
+    stream_midifile,
     tempo2bpm,
     tick2second,
 )
@@ -123,11 +140,17 @@ from .parser import Parser, parse, parse_all
 from .syx import read_syx_file, write_syx_file
 from .version import version_info
 
+# Pythonic short alias: ``with mido.open('song.mid') as midi:``.
+open = open_midifile
+
 if TYPE_CHECKING:
     from .backends.backend import get_input_names, get_ioport_names, get_output_names
 
 __all__ = [
     "KeySignatureError",
+    "LazyMidiFile",
+    "LazyMidiFileReader",
+    "LazyMidiFileStream",
     "MAX_PITCHWHEEL",
     "MAX_SONGPOS",
     "MIN_PITCHWHEEL",
@@ -135,20 +158,34 @@ __all__ = [
     "Message",
     "MetaMessage",
     "MidiFile",
+    "MidiFileReader",
+    "MidiFileStream",
+    "MidiFileStreamReader",
+    "MidiStream",
     "MidiTrack",
+    "MidiTrackStream",
     "Parser",
+    "StreamingMidiFile",
+    "StreamingMidiFileReader",
     "UnknownMetaMessage",
     "bpm2tempo",
     "format_as_string",
     "merge_tracks",
+    "open",
+    "open_midi_file",
+    "open_midifile",
+    "open_stream",
     "parse",
     "parse_all",
     "parse_string",
     "parse_string_stream",
     "ports",
+    "read_midi",
     "read_syx_file",
     "second2tick",
     "sockets",
+    "stream_midi_file",
+    "stream_midifile",
     "tempo2bpm",
     "tick2second",
     "version_info",

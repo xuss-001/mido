@@ -167,6 +167,39 @@ def read_meta_message(infile, delta):
     return build_meta_message(meta_type, data, delta)
 
 
+def read_track_message(infile, last_status=None, clip=False):
+    """Read one MIDI message from a track chunk.
+
+    ``last_status`` is the running status byte from the preceding message.
+    It is returned together with the message so callers can read a track
+    incrementally without storing the whole track.
+    """
+    delta = read_variable_int(infile)
+    status_byte = read_byte(infile)
+
+    if status_byte < 0x80:
+        if last_status is None:
+            raise OSError('running status without last_status')
+        peek_data = [status_byte]
+        status_byte = last_status
+    else:
+        if status_byte != 0xff:
+            # Meta messages don't set running status.
+            last_status = status_byte
+        peek_data = []
+
+    if status_byte == 0xff:
+        msg = read_meta_message(infile, delta)
+    elif status_byte in [0xf0, 0xf7]:
+        # TODO: I'm not quite clear on the difference between
+        # f0 and f7 events.
+        msg = read_sysex(infile, delta, clip)
+    else:
+        msg = read_message(infile, status_byte, peek_data, delta, clip)
+
+    return msg, last_status
+
+
 def read_track(infile, debug=False, clip=False):
     track = MidiTrack()
 
@@ -190,36 +223,14 @@ def read_track(infile, debug=False, clip=False):
         if debug:
             _dbg('Message:')
 
-        delta = read_variable_int(infile)
-
-        if debug:
-            _dbg(f'-> delta={delta}')
-
-        status_byte = read_byte(infile)
-
-        if status_byte < 0x80:
-            if last_status is None:
-                raise OSError('running status without last_status')
-            peek_data = [status_byte]
-            status_byte = last_status
-        else:
-            if status_byte != 0xff:
-                # Meta messages don't set running status.
-                last_status = status_byte
-            peek_data = []
-
-        if status_byte == 0xff:
-            msg = read_meta_message(infile, delta)
-        elif status_byte in [0xf0, 0xf7]:
-            # TODO: I'm not quite clear on the difference between
-            # f0 and f7 events.
-            msg = read_sysex(infile, delta, clip)
-        else:
-            msg = read_message(infile, status_byte, peek_data, delta, clip)
+        msg, last_status = read_track_message(
+            infile, last_status=last_status, clip=clip
+        )
 
         track.append(msg)
 
         if debug:
+            _dbg(f'-> delta={msg.time}')
             _dbg(f'-> {msg!r}')
             _dbg()
 
@@ -289,6 +300,18 @@ def get_seconds_per_tick(tempo, ticks_per_beat):
 
 
 class MidiFile:
+    def __new__(cls, *args, **kwargs):
+        if cls is MidiFile and (
+            kwargs.get("lazy") or kwargs.get("stream") or kwargs.get("streaming")
+        ):
+            from .streaming import MidiFileStream
+
+            kwargs.pop("lazy", None)
+            kwargs.pop("stream", None)
+            kwargs.pop("streaming", None)
+            return MidiFileStream(*args, **kwargs)
+        return super().__new__(cls)
+
     def __init__(self, filename=None, file=None,
                  type=1, ticks_per_beat=DEFAULT_TICKS_PER_BEAT,
                  charset='latin1',
@@ -318,6 +341,25 @@ class MidiFile:
         elif self.filename is not None:
             with open(filename, 'rb') as file:
                 self._load(file)
+
+    @classmethod
+    def open_stream(cls, source=None, **kwargs):
+        """Open a path or seekable binary stream for on-demand reading."""
+        from .streaming import MidiFileStream
+
+        if source is not None:
+            return MidiFileStream(source, **kwargs)
+        return MidiFileStream(**kwargs)
+
+    @classmethod
+    def open(cls, source=None, **kwargs):
+        """Alias for :meth:`open_stream`."""
+        return cls.open_stream(source, **kwargs)
+
+    @classmethod
+    def lazy(cls, source=None, **kwargs):
+        """Alias for :meth:`open_stream`."""
+        return cls.open_stream(source, **kwargs)
 
     @property
     def merged_track(self):
@@ -507,3 +549,12 @@ class MidiFile:
 
     def __exit__(self, type, value, traceback):
         return False
+
+
+# Exposed here for callers that import the implementation module directly.
+from .streaming import (  # noqa: E402
+    MidiFileReader,
+    MidiFileStream,
+    StreamingMidiFile,
+    open_midifile,
+)

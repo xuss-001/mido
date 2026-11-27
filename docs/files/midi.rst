@@ -41,6 +41,63 @@ and messages and save the file back by calling the ``save()``
 method. (More on this below.)
 
 
+Reading Large Files On Demand
+-----------------------------
+
+Use :func:`mido.open_midifile` (or :class:`mido.MidiFileStream`) when you want
+to inspect a few events from a large file without decoding and storing every
+message::
+
+    with mido.open_midifile('large-song.mid') as midi:
+        for message in midi.tracks[0]:
+            print(message.time, message)
+            if message.type == 'end_of_track':
+                break
+
+The source can be a path-like object or any seekable binary stream::
+
+    midi = mido.MidiFileStream(file=open('large-song.mid', 'rb'))
+
+``MidiFile(..., lazy=True)`` returns the same reader. The ordinary
+``MidiFile`` constructor and its eager ``tracks`` behavior are unchanged.
+
+Track objects are re-iterable, and ``iter_track()`` returns a fresh independent
+iterator. Several iterators over the same track, over different tracks, or
+over different readers that share one caller-provided stream can be advanced
+in alternation. Each iterator stores its own chunk position and MIDI running
+status; reads seek back to that position before decoding the next message.
+Stopping early does not consume the track for future iterations.
+
+Messages yielded track by track keep ``time`` as the delta in ticks from the
+preceding message in that track.
+
+For type 0 and type 1 files, ``iter_merged()`` performs a stable playback-order
+merge using one lookahead message per track. By default the yielded ``time`` is
+the delta in seconds, computed with the current tempo so tempo changes are
+applied to the interval that follows them. Events at the same tick keep the
+order produced by the stable track merge (track order, then order within each
+track)::
+
+    with mido.open_midifile('large-song.mid') as midi:
+        for message in midi.iter_merged():
+            print(message.time, message)
+
+Use ``midi.iter_merged(time_unit='ticks')`` for tick deltas, or
+``absolute=True`` for absolute times. Type 2 files are asynchronous and only
+support track-by-track reading; calling ``iter_merged()`` raises ``TypeError``.
+
+The reader stores chunk locations and at most one pending merged message per
+track. Additional memory therefore grows with the number of tracks rather than
+the total number of events, and the first messages are decoded before the rest
+of the file is parsed.
+
+Closing a reader closes only files that it opened from a path. A stream passed
+as ``file=...`` remains open and belongs to the caller.
+
+A runnable example is available in
+``examples/midifiles/stream_large_midi_file.py``.
+
+
 Iterating Over Messages
 -----------------------
 
